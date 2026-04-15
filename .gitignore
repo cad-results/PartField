@@ -7,11 +7,6 @@ __pycache__/
 exp_results/
 lightning_logs/
 
-# Claude
-.claude/
-CLAUDE.md
-.pi/
-
 # OS
 .DS_Store
 Thumbs.db

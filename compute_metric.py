@@ -29,7 +29,7 @@ def eval_single_gt_shape(gt_label, pred_masks):
 
 def eval_whole_dataset(pred_folder, merge_parts=False):
     print(pred_folder)
-    meta = json.load(open("/home/mikaelaangel/Desktop/data/PartObjaverse-Tiny_semantic.json", "r"))
+    meta = json.load(open("/home/user/Desktop/data/PartObjaverse-Tiny_semantic.json", "r"))
 
     categories = meta.keys()
     results_per_cat = {}
