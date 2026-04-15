@@ -84,7 +84,7 @@ class Model(pl.LightningModule):
 
     @torch.no_grad()
     def predict_step(self, batch, batch_idx):
-        save_dir = f"exp_results/{self.cfg.result_name}"
+        save_dir = os.path.join(self.cfg.output_dir, self.cfg.result_name)
         os.makedirs(save_dir, exist_ok=True)
 
         uid = batch['uid'][0]

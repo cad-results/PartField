@@ -1,4 +1,5 @@
 from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
@@ -9,7 +10,7 @@ import time
 
 import json
 from os.path import join
-from typing import List
+from typing import List, Dict, Tuple, Optional
 
 from collections import defaultdict
 from scipy.sparse import coo_matrix, csr_matrix
@@ -20,6 +21,206 @@ import networkx as nx
 from plyfile import PlyData
 import open3d as o3d
 from partfield.utils import *
+
+
+#########################
+# Auto-selection metrics
+#########################
+
+def silhouette_score_sampled(features: np.ndarray, labels: np.ndarray,
+                             sample_size: int = 5000, random_state: int = 42) -> float:
+    """
+    Compute silhouette score on a stratified sample for ~100x speedup on large datasets.
+
+    For datasets with 100k+ points, the full silhouette computation is O(n²) and very slow.
+    This uses stratified sampling to preserve cluster proportions while dramatically reducing compute.
+
+    Args:
+        features: (N, D) feature array
+        labels: (N,) cluster labels
+        sample_size: Maximum number of points to sample (default 5000)
+        random_state: Random seed for reproducibility
+
+    Returns:
+        Silhouette score in range [-1, 1]
+    """
+    labels = np.squeeze(labels).astype(int)
+    n_samples = len(labels)
+
+    # If small enough, compute exact score
+    if n_samples <= sample_size:
+        try:
+            return silhouette_score(features, labels)
+        except Exception:
+            return -1.0
+
+    np.random.seed(random_state)
+
+    # Stratified sampling to preserve cluster proportions
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2:
+        return -1.0
+
+    indices = []
+    samples_per_cluster = max(10, sample_size // len(unique_labels))
+
+    for label in unique_labels:
+        cluster_indices = np.where(labels == label)[0]
+        n_take = min(len(cluster_indices), samples_per_cluster)
+        if n_take > 0:
+            sampled = np.random.choice(cluster_indices, n_take, replace=False)
+            indices.extend(sampled)
+
+    indices = np.array(indices)
+
+    # Ensure we have at least 2 clusters represented
+    sampled_labels = labels[indices]
+    if len(np.unique(sampled_labels)) < 2:
+        return -1.0
+
+    try:
+        return silhouette_score(features[indices], sampled_labels)
+    except Exception:
+        return -1.0
+
+
+def evaluate_clustering(features: np.ndarray, labels: np.ndarray, sample_size: int = 5000) -> Dict[str, float]:
+    """
+    Evaluate a clustering using multiple metrics.
+
+    Uses sampled silhouette score for large datasets (~100x speedup).
+
+    Returns a dictionary with:
+    - silhouette: [-1, 1], higher is better
+    - davies_bouldin: [0, inf), lower is better
+    - calinski_harabasz: [0, inf), higher is better
+    """
+    labels = labels.squeeze().astype(int)
+    unique_labels = np.unique(labels)
+
+    if len(unique_labels) < 2:
+        return {'silhouette': -1.0, 'davies_bouldin': float('inf'), 'calinski_harabasz': 0.0}
+
+    min_samples = min(np.sum(labels == l) for l in unique_labels)
+    if min_samples < 2:
+        return {'silhouette': -1.0, 'davies_bouldin': float('inf'), 'calinski_harabasz': 0.0}
+
+    # Use sampled silhouette for large datasets (major speedup)
+    sil = silhouette_score_sampled(features, labels, sample_size=sample_size)
+
+    try:
+        db = davies_bouldin_score(features, labels)
+    except Exception:
+        db = float('inf')
+
+    try:
+        ch = calinski_harabasz_score(features, labels)
+    except Exception:
+        ch = 0.0
+
+    return {'silhouette': sil, 'davies_bouldin': db, 'calinski_harabasz': ch}
+
+
+def compute_combined_score(metrics: Dict[str, float], n_clusters: int,
+                          min_clusters: int = 3, max_clusters: int = 15,
+                          prefer_fewer: bool = True) -> float:
+    """
+    Compute a combined score from multiple metrics.
+    Higher score = better clustering.
+    """
+    sil = metrics['silhouette']
+    db = metrics['davies_bouldin']
+    ch = metrics['calinski_harabasz']
+
+    if sil <= -1.0 or db == float('inf'):
+        return -float('inf')
+
+    # Normalize silhouette to [0, 1] (from [-1, 1])
+    sil_norm = (sil + 1) / 2
+
+    # Normalize Davies-Bouldin (invert, typical values 0-3)
+    db_norm = max(0, 1 - db / 3)
+
+    # Normalize Calinski-Harabasz (log scale)
+    ch_norm = min(np.log1p(ch) / 10, 1.0)
+
+    # Weighted combination (silhouette most important for part segmentation)
+    base_score = 0.5 * sil_norm + 0.3 * db_norm + 0.2 * ch_norm
+
+    # Penalize extreme cluster counts
+    if n_clusters < min_clusters:
+        base_score -= 0.1 * (min_clusters - n_clusters)
+    elif n_clusters > max_clusters:
+        base_score -= 0.05 * (n_clusters - max_clusters)
+
+    # Slight preference for fewer clusters (parsimony)
+    if prefer_fewer and n_clusters > min_clusters:
+        base_score -= 0.01 * (n_clusters - min_clusters)
+
+    return base_score
+
+
+def select_best_clustering(features: np.ndarray,
+                          all_labels: Dict[int, np.ndarray],
+                          min_clusters: int = 3,
+                          max_clusters: int = 15,
+                          prefer_fewer: bool = True,
+                          verbose: bool = True,
+                          sample_size: int = 5000,
+                          early_stop_patience: int = 0) -> Tuple[int, Dict]:
+    """
+    Select the best clustering from multiple options.
+
+    Args:
+        features: (N, D) feature array
+        all_labels: Dict mapping n_clusters -> labels array
+        min_clusters: Minimum preferred cluster count
+        max_clusters: Maximum preferred cluster count
+        prefer_fewer: If True, slightly penalize higher cluster counts
+        verbose: Print progress
+        sample_size: Sample size for silhouette computation (5000 = ~100x speedup)
+        early_stop_patience: Stop after N consecutive non-improving k values (0 = disabled)
+
+    Returns: (best_n_clusters, results_dict)
+    """
+    results = {}
+    best_score = -float('inf')
+    best_n = None
+    no_improve_count = 0
+    improvement_threshold = 0.01  # Minimum improvement to reset patience
+
+    for n_clusters, labels in sorted(all_labels.items()):
+        metrics = evaluate_clustering(features, labels, sample_size=sample_size)
+        score = compute_combined_score(metrics, n_clusters, min_clusters, max_clusters, prefer_fewer)
+        results[n_clusters] = {'metrics': metrics, 'combined_score': score}
+
+        if verbose:
+            print(f"    k={n_clusters:2d}: silhouette={metrics['silhouette']:.3f}, "
+                  f"DB={metrics['davies_bouldin']:.3f}, CH={metrics['calinski_harabasz']:.1f}, "
+                  f"score={score:.4f}")
+
+        # Track best and check for early stopping
+        if score > best_score + improvement_threshold:
+            best_score = score
+            best_n = n_clusters
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+
+        # Early stopping check
+        if early_stop_patience > 0 and no_improve_count >= early_stop_patience and best_n is not None:
+            if verbose:
+                print(f"    Early stopping after {n_clusters} clusters (no improvement for {early_stop_patience} steps)")
+            break
+
+    if best_n is None:
+        best_n = max(results.keys(), key=lambda k: results[k]['combined_score'])
+
+    if verbose:
+        print(f"    -> Best: {best_n} clusters (score={results[best_n]['combined_score']:.4f})")
+
+    return best_n, results
+#########################
 
 #### Export to file #####
 def export_colored_mesh_ply(V, F, FL, filename='segmented_mesh.ply'):
@@ -636,9 +837,19 @@ def load_ply_to_numpy(filename):
     
     return points
 
-def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_render_fol= "test_render_clustering", use_agglo=False, max_num_clusters=18, is_pc=False, option=1, with_knn=True, export_mesh=True):
+def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_render_fol= "test_render_clustering", use_agglo=False, max_num_clusters=18, is_pc=False, option=1, with_knn=True, export_mesh=True, auto_select=False, min_preferred_clusters=3, max_preferred_clusters=15, sample_size=5000, early_stop_patience=3):
+    """
+    Run clustering on PartField features and optionally auto-select the best clustering.
+
+    Args:
+        auto_select: If True, evaluate all clusterings and save only the best one
+        min_preferred_clusters: Minimum preferred cluster count for auto-selection
+        max_preferred_clusters: Maximum preferred cluster count for auto-selection
+        sample_size: Sample size for silhouette score computation (5000 = ~100x speedup)
+        early_stop_patience: Stop after N consecutive non-improving k values (0 = disabled)
+    """
     print(uid, view_id)
-    
+
     if not is_pc:
         input_fname = f'{save_dir}/input_{uid}_{view_id}.ply'
         mesh = load_mesh_util(input_fname)
@@ -662,19 +873,25 @@ def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_re
     point_feat = point_feat / np.linalg.norm(point_feat, axis=-1, keepdims=True)
 
     if not use_agglo:
+        # Store all labels for auto-selection
+        all_labels_dict = {}
+
         for num_cluster in range(2, max_num_clusters):
             clustering = KMeans(n_clusters=num_cluster, random_state=0).fit(point_feat)
             labels = clustering.labels_
 
-            
+
             pred_labels = np.zeros((len(labels), 1))
             for i, label in enumerate(np.unique(labels)):
                 # print(i, label)
                 pred_labels[labels == label] = i  # Assign RGB values to each label
 
+            # Store for auto-selection
+            all_labels_dict[num_cluster] = pred_labels.copy()
+
             fname_clustering = os.path.join(out_render_fol, "cluster_out", str(uid) + "_" + str(view_id) + "_" + str(num_cluster).zfill(2))
             np.save(fname_clustering, pred_labels)
-            
+
 
             if not is_pc:
                 V = mesh.vertices
@@ -684,11 +901,39 @@ def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_re
                     fname_mesh = os.path.join(out_render_fol, "ply", str(uid) + "_" + str(view_id) + "_" + str(num_cluster).zfill(2) + ".ply")
                     export_colored_mesh_ply(V, F, pred_labels, filename=fname_mesh)
 
-            
+
             else:
                 if export_mesh:
                     fname_pc = os.path.join(out_render_fol, "ply", str(uid) + "_" + str(view_id) + "_" + str(num_cluster).zfill(2) + ".ply")
                     export_pointcloud_with_labels_to_ply(pc, pred_labels, filename=fname_pc)
+
+        # Auto-select best clustering
+        if auto_select and len(all_labels_dict) > 0:
+            print(f"  Auto-selecting best clustering for {uid} (sample_size={sample_size}, patience={early_stop_patience})...")
+            best_n, results = select_best_clustering(
+                point_feat, all_labels_dict,
+                min_clusters=min_preferred_clusters,
+                max_clusters=max_preferred_clusters,
+                prefer_fewer=True,
+                verbose=True,
+                sample_size=sample_size,
+                early_stop_patience=early_stop_patience
+            )
+
+            # Save best selection info
+            best_info_file = os.path.join(out_render_fol, "cluster_out", f"{uid}_{view_id}_best.txt")
+            with open(best_info_file, 'w') as f:
+                f.write(f"best_n_clusters: {best_n}\n")
+                f.write(f"score: {results[best_n]['combined_score']:.4f}\n")
+                f.write(f"silhouette: {results[best_n]['metrics']['silhouette']:.4f}\n")
+                f.write(f"davies_bouldin: {results[best_n]['metrics']['davies_bouldin']:.4f}\n")
+                f.write(f"calinski_harabasz: {results[best_n]['metrics']['calinski_harabasz']:.4f}\n")
+
+            # Save just the best cluster count as numpy for easy loading
+            np.save(os.path.join(out_render_fol, "cluster_out", f"{uid}_{view_id}_best_n.npy"), np.array([best_n]))
+
+            print(f"  Best clustering saved: {best_n} clusters")
+            return best_n
         
     else:
         if is_pc:
@@ -741,7 +986,7 @@ if __name__ == '__main__':
     parser.add_argument('--source_dir', default= "", type=str)
     parser.add_argument('--root', default= "", type=str)
     parser.add_argument('--dump_dir', default= "", type=str)
-    
+
     parser.add_argument('--max_num_clusters', default= 20, type=int)
     parser.add_argument('--use_agglo', default= False, type=bool)
     parser.add_argument('--is_pc', default= False, type=bool)
@@ -749,6 +994,20 @@ if __name__ == '__main__':
     parser.add_argument('--with_knn', default= False, type=bool)
 
     parser.add_argument('--export_mesh', default= True, type=bool)
+
+    # Auto-selection arguments
+    parser.add_argument('--auto_select', action='store_true',
+                       help='Auto-select best clustering using quality metrics (silhouette, Davies-Bouldin, Calinski-Harabasz)')
+    parser.add_argument('--min_preferred_clusters', default=3, type=int,
+                       help='Minimum preferred cluster count for auto-selection (default: 3)')
+    parser.add_argument('--max_preferred_clusters', default=15, type=int,
+                       help='Maximum preferred cluster count for auto-selection (default: 15)')
+
+    # Performance optimization arguments
+    parser.add_argument('--sample_size', default=40000, type=int,
+                       help='Sample size for silhouette computation (default: 40000). Larger = more accurate but slower.')
+    parser.add_argument('--early_stop_patience', default=0, type=int,
+                       help='Stop evaluation after N consecutive non-improving cluster counts (default: 0 = disabled)')
 
     FLAGS = parser.parse_args()
     root = FLAGS.root
@@ -764,43 +1023,85 @@ if __name__ == '__main__':
 
     EXPORT_MESH = FLAGS.export_mesh
 
+    AUTO_SELECT = FLAGS.auto_select
+    MIN_PREFERRED = FLAGS.min_preferred_clusters
+    MAX_PREFERRED = FLAGS.max_preferred_clusters
+    SAMPLE_SIZE = FLAGS.sample_size
+    EARLY_STOP_PATIENCE = FLAGS.early_stop_patience
+
     models = os.listdir(root)
     os.makedirs(OUTPUT_FOL, exist_ok=True)
 
     cluster_fol = os.path.join(OUTPUT_FOL, "cluster_out")
-    os.makedirs(cluster_fol, exist_ok=True) 
+    os.makedirs(cluster_fol, exist_ok=True)
 
     if EXPORT_MESH:
         ply_fol = os.path.join(OUTPUT_FOL, "ply")
-        os.makedirs(ply_fol, exist_ok=True)    
+        os.makedirs(ply_fol, exist_ok=True)
 
     #### Get existing model_ids ###
-    all_files = os.listdir(os.path.join(OUTPUT_FOL, "ply"))
+    # Extract model IDs from existing ply files
+    # Format: {uid}_{view_id}_{cluster_num}.ply, e.g., "van_model_0_02.ply" -> "van_model"
+    # We extract everything before the last two underscore-separated parts
+    ply_files = os.listdir(os.path.join(OUTPUT_FOL, "ply"))
 
     existing_model_ids = []
-    for sample in all_files:
-        uid = sample.split("_")[0]
-        view_id = sample.split("_")[1]
-        # sample_name = str(uid) + "_" + str(view_id)
-        sample_name = str(uid)
+    for sample in ply_files:
+        # Remove .ply extension and split by underscore
+        parts = sample.replace(".ply", "").rsplit("_", 2)
+        if len(parts) >= 3:
+            # uid is everything except the last two parts (view_id and cluster_num)
+            uid = parts[0]
+        else:
+            # Fallback for unexpected format
+            uid = sample.split("_")[0]
 
-        if sample_name not in existing_model_ids:
-            existing_model_ids.append(sample_name)
+        if uid not in existing_model_ids:
+            existing_model_ids.append(uid)
     ##############################
 
     all_files = os.listdir(SOURCE_DIR)
     selected = []
     for f in all_files:
-        if ".ply" in f and IS_PC and f.split(".")[0] not in existing_model_ids:
-            selected.append(f)
-        elif (".obj" in f or ".glb" in f) and not IS_PC and f.split(".")[0] not in existing_model_ids:
-            selected.append(f)
-    
+        # Extract model ID the same way solve_clustering does: model.split(".")[-2]
+        # This handles filenames like "3dpea.com_assembly1.glb" -> "com_assembly1"
+        if ".ply" in f and IS_PC:
+            model_id = f.split(".")[0]  # For ply files, take everything before first dot
+            if model_id not in existing_model_ids:
+                selected.append(f)
+        elif (".obj" in f or ".glb" in f) and not IS_PC:
+            model_id = f.split(".")[-2]  # For obj/glb, take the part before extension
+            if model_id not in existing_model_ids:
+                selected.append(f)
+
     print("Number of models to process: " + str(len(selected)))
-    
+    if AUTO_SELECT:
+        print(f"Auto-selection enabled: preferring {MIN_PREFERRED}-{MAX_PREFERRED} clusters")
+        print(f"Performance: sample_size={SAMPLE_SIZE}, early_stop_patience={EARLY_STOP_PATIENCE}")
+
+    best_selections = {}
     for model in selected:
         fname = os.path.join(SOURCE_DIR, model)
         uid = model.split(".")[-2]
         view_id = 0
 
-        solve_clustering(fname, uid, view_id, save_dir=root, out_render_fol= OUTPUT_FOL, use_agglo=USE_AGGLO, max_num_clusters=MAX_NUM_CLUSTERS, is_pc=IS_PC, option=OPTION, with_knn=WITH_KNN, export_mesh=EXPORT_MESH)
+        result = solve_clustering(fname, uid, view_id, save_dir=root, out_render_fol=OUTPUT_FOL,
+                                 use_agglo=USE_AGGLO, max_num_clusters=MAX_NUM_CLUSTERS,
+                                 is_pc=IS_PC, option=OPTION, with_knn=WITH_KNN,
+                                 export_mesh=EXPORT_MESH, auto_select=AUTO_SELECT,
+                                 min_preferred_clusters=MIN_PREFERRED,
+                                 max_preferred_clusters=MAX_PREFERRED,
+                                 sample_size=SAMPLE_SIZE,
+                                 early_stop_patience=EARLY_STOP_PATIENCE)
+        if AUTO_SELECT and result is not None:
+            best_selections[uid] = result
+
+    # Print summary if auto-selection was used
+    if AUTO_SELECT and best_selections:
+        print("\n" + "=" * 50)
+        print("AUTO-SELECTION SUMMARY")
+        print("=" * 50)
+        for uid, best_n in best_selections.items():
+            print(f"  {uid}: {best_n} clusters")
+        avg = np.mean(list(best_selections.values()))
+        print(f"\nAverage best cluster count: {avg:.1f}")

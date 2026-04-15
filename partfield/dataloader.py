@@ -81,6 +81,7 @@ class Demo_Dataset(torch.utils.data.Dataset):
 
         self.preprocess_mesh = cfg.preprocess_mesh
         self.result_name = cfg.result_name
+        self.output_dir = cfg.output_dir
 
         print("val dataset len:", len(self.data_list))
 
@@ -170,9 +171,9 @@ class Demo_Dataset(torch.utils.data.Dataset):
                 print(mesh.faces.shape)
 
             ### Save input
-            save_dir = f"exp_results/{self.result_name}"
+            save_dir = os.path.join(self.output_dir, self.result_name)
             os.makedirs(save_dir, exist_ok=True)
-            view_id = 0            
+            view_id = 0
             mesh.export(f'{save_dir}/input_{uid}_{view_id}.ply')                
 
 
@@ -217,10 +218,11 @@ class Demo_Remesh_Dataset(torch.utils.data.Dataset):
 
         self.preprocess_mesh = cfg.preprocess_mesh
         self.result_name = cfg.result_name
+        self.output_dir = cfg.output_dir
 
         print("val dataset len:", len(self.data_list))
 
-    
+
     def __len__(self):
         return len(self.data_list)
 
@@ -269,10 +271,10 @@ class Demo_Remesh_Dataset(torch.utils.data.Dataset):
             print(mesh.faces.shape)
 
         ### Save input
-        save_dir = f"exp_results/{self.result_name}"
+        save_dir = os.path.join(self.output_dir, self.result_name)
         os.makedirs(save_dir, exist_ok=True)
-        view_id = 0            
-        mesh.export(f'{save_dir}/input_{uid}_{view_id}.ply')   
+        view_id = 0
+        mesh.export(f'{save_dir}/input_{uid}_{view_id}.ply')
 
         try:
             ###### Remesh ######
