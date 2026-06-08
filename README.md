@@ -25,6 +25,9 @@ PartField is a feedforward model that predicts part-based feature fields for 3D 
 - [Discussion](#discussion-clustering-with-messy-mesh-connectivities)
 - [Primitive Generation and Visualization](#primitive-generation-and-visualization)
 - [Bounding Box Generation](#bounding-box-generation)
+- [BREP CAD Output](#brep-cad-output)
+  - [Boxes + Cylinders Mode](#boxes--cylinders-mode)
+  - [Primitive Shapes Roadmap](#primitive-shapes-roadmap)
 - [Scripts Reference](#scripts-reference)
 - [Citation](#citation)
 
@@ -34,6 +37,8 @@ PartField is a feedforward model that predicts part-based feature fields for 3D 
 mkdir model
 ```
 The link to download our pretrained model is here: [Trained on Objaverse](https://huggingface.co/mikaelaangel/partfield-ckpt/blob/main/model_objaverse.ckpt). Due to licensing restrictions, we are unable to release the model that was also trained on PartNet.
+
+**Mirror:** [https://huggingface.co/cad-weights/PartField](https://huggingface.co/cad-weights/PartField)
 
 ## Environment Setup
 
@@ -639,21 +644,22 @@ pip install PyQt5
 
 ```bash
 # STEP → STEP: Full pipeline from a CAD file to bounding-box CAD file
-python step_to_brep.py -i model.step -o model_bboxes.step
+./run_step_to_brep.sh -i model.step -o model_bboxes.step
 python step_to_brep.py -i model.step -o model_bboxes.step --clusters 5
 python step_to_brep.py -i model.step -o model_bboxes.step --alignment global
 
-# Generate BREP bounding boxes from mesh + labels (manual pipeline)
+# STEP → STEP with smart box/cylinder selection
+./run_step_to_brep_cylinder.sh -i model.step -o model_bbox_cyl.step
+python step_to_brep.py -i model.step -o model_bbox_cyl.step --mode bbox_cylinder
+
+# Generate BREP from mesh + labels (manual pipeline)
 python brep_generator.py -i model.glb -l labels.npy -o result.step --mode bbox
-
-# Generate with global alignment
-python brep_generator.py -i model.glb -l labels.npy -o result.step --mode bbox --alignment global
-
-# Generate BREP from primitives
+python brep_generator.py -i model.glb -l labels.npy -o result.step --mode bbox_cylinder
 python brep_generator.py -i model.glb -l labels.npy -o result.step --mode primitive
 
 # View BREP in interactive viewer
 ./run_brep_viewer.sh result.step
+./run_brep_viewer.sh --browse exp_results/brep/
 
 # On-the-fly: generate + view
 python brep_viewer.py --mesh model.glb --labels labels.npy
@@ -667,12 +673,12 @@ python segment_with_primitives.py -i model.glb -l labels.npy -o output.ply --bre
 
 | Variant | Script | Clusters | Alignment | Output |
 |---------|--------|----------|-----------|--------|
-| 1 | `pipeline_variant1_auto_self.sh` | Auto 2-20 | Self | PLY |
-| 2 | `pipeline_variant2_auto_global.sh` | Auto 2-20 | Global | PLY |
+| 1 | `pipeline_variant1_auto_self.sh` | Auto 2-50 | Self | PLY |
+| 2 | `pipeline_variant2_auto_global.sh` | Auto 2-50 | Global | PLY |
 | 3 | `pipeline_variant3_fixed5_self.sh` | Fixed 5 | Self | PLY |
 | 4 | `pipeline_variant4_fixed5_global.sh` | Fixed 5 | Global | PLY |
-| **5** | `pipeline_variant5_auto_self_brep.sh` | Auto 2-20 | Self | **STEP** |
-| **6** | `pipeline_variant6_auto_global_brep.sh` | Auto 2-20 | Global | **STEP** |
+| **5** | `pipeline_variant5_auto_self_brep.sh` | Auto 2-50 | Self | **STEP** |
+| **6** | `pipeline_variant6_auto_global_brep.sh` | Auto 2-50 | Global | **STEP** |
 | **7** | `pipeline_variant7_fixed5_self_brep.sh` | Fixed 5 | Self | **STEP** |
 | **8** | `pipeline_variant8_fixed5_global_brep.sh` | Fixed 5 | Global | **STEP** |
 
@@ -686,6 +692,47 @@ Variants 5-8 produce STEP files using the same PartField features and clustering
 | BREP Viewer | `brep_viewer.py` + `run_brep_viewer.sh` | STEP, STP | CAD solid |
 
 See [VIEWER.md](VIEWER.md) for detailed viewer documentation and [SCRIPTS.md](SCRIPTS.md) for the full pipeline reference.
+
+### Boxes + Cylinders Mode
+
+The `bbox_cylinder` mode intelligently selects between oriented bounding boxes and circumscribed cylinders for each segment. It analyzes the cross-section circularity of each bounding box along all three axes:
+
+- **Circular cross-section** (score > 0.5) → cylinder, oriented along that axis
+- **Rectangular cross-section** → standard bounding box
+
+This produces results that match the original geometry more closely: pipes and rods become cylinders, flat panels stay as boxes, rocket bodies get short fat cylinders, etc.
+
+```bash
+# End-to-end with wrapper script (includes dependency checks + viewer)
+./run_step_to_brep_cylinder.sh -i model.step -o model_bbox_cyl.step
+
+# Or directly via step_to_brep.py
+python step_to_brep.py -i model.step -o model_bbox_cyl.step --mode bbox_cylinder
+
+# Batch mode
+./run_step_to_brep_cylinder.sh --input-dir steps/ --output-dir brep_cyl_out/
+
+# Standalone from mesh + labels
+python brep_generator.py -i model.glb -l labels.npy -o result.step --mode bbox_cylinder
+
+# View results
+./run_brep_viewer.sh model_bbox_cyl.step
+./run_brep_viewer.sh --browse exp_results/brep/
+```
+
+The cylinder's radius circumscribes the bounding box's cross-section ("circles the square"), and its height matches the extent along the chosen axis. Each segment gets exactly one shape — the one that best matches the original BREP section's geometry.
+
+### Primitive Shapes Roadmap
+
+The cylinder mode is the first step in a broader plan to derive geometric primitives from bounding box geometry. See [PRIMITIVE_SHAPES_ROADMAP.md](PRIMITIVE_SHAPES_ROADMAP.md) for the full roadmap covering:
+
+- **Sphere** — from near-cubic bounding boxes
+- **Capsule** — elongated cylinders with hemispherical caps
+- **Cone** — tapered segments with varying cross-section density
+- **Ellipsoid** — three distinct, non-extreme aspect ratios
+- **Hemisphere** — dome-like segments
+
+Each primitive follows the same architecture: analyze the bounding box geometry, derive shape parameters, and use the existing `BRepShapeBuilder.make_*()` methods for CAD-quality STEP output.
 
 ---
 
@@ -706,6 +753,8 @@ See [VIEWER.md](VIEWER.md) for detailed viewer documentation and [SCRIPTS.md](SC
 | `brep_generator.py` | Generate BREP CAD files (STEP) from segmentation results |
 | `brep_viewer.py` | Interactive Qt+pythonOCC viewer for STEP files |
 | `run_brep_viewer.sh` | Wrapper script for BREP viewer with WSL2/Qt support |
+| `run_step_to_brep.sh` | Wrapper script for STEP→BREP bbox pipeline with dependency checks + viewer |
+| `run_step_to_brep_cylinder.sh` | Wrapper script for STEP→BREP box+cylinder pipeline with dependency checks + viewer |
 | `process_obj_batch.py` | Batch processing pipeline for OBJ files |
 | `compute_metric.py` | Evaluation metrics computation |
 
@@ -1040,6 +1089,27 @@ python process_obj_batch.py \
 ./run_viewer.sh --browse exp_results/clustering/batch_run_flat/ply/
 ```
 
+### Workflow 5: STEP → BREP Bounding Boxes
+```bash
+# End-to-end from a CAD STEP file to segmented BREP
+./run_step_to_brep.sh -i data/stepfiles/model.step -o exp_results/brep/model_bboxes.step
+
+# View original vs generated
+./run_brep_viewer.sh --visualize data/stepfiles/model.step exp_results/brep/model_bboxes.step
+```
+
+### Workflow 6: STEP → BREP Boxes + Cylinders
+```bash
+# Smart box/cylinder selection per segment
+./run_step_to_brep_cylinder.sh -i data/stepfiles/model.step -o exp_results/brep/model_bbox_cyl.step
+
+# View results
+./run_brep_viewer.sh exp_results/brep/model_bbox_cyl.step
+
+# Batch processing
+./run_step_to_brep_cylinder.sh --input-dir data/stepfiles/ --output-dir exp_results/brep/cylinders/
+```
+
 ---
 
 ## Directory Structure
@@ -1065,7 +1135,8 @@ PartField/
 │   │       ├── *_wireframe.ply
 │   │       ├── *_transparent.ply
 │   │       └── *_info.txt
-│   └── primitives/                # Primitive fitting outputs
+│   ├── primitives/                # Primitive fitting outputs
+│   └── brep/                      # BREP STEP outputs (boxes, cylinders)
 ├── model/                         # Pretrained model
 │   └── model_objaverse.ckpt
 └── configs/                       # Configuration files
